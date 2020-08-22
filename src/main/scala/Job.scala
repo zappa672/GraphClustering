@@ -20,7 +20,7 @@ object Job extends App {
 
   val sc: SparkContext = spark.sparkContext
 
-  val filePath: String = this.getClass.getResource("/input/1.graph").getPath
+  val filePath: String = this.getClass.getResource("/input/test0.graph").getPath
 
   logger.warn(s"Read graph data $filePath.")
   val (edges, adjLists) = loadGraph(filePath)
@@ -32,9 +32,8 @@ object Job extends App {
   logger.warn(s"Total degree: $graphTotalDegree, V = $v, E = $e")
 
   val communities: RDD[(Int, Seq[Int])] = getCommunities
-  //    logger.warn( s"Communities: \n" + communities.collect().sortBy(_.min).map(_.toList.sorted).mkString("\n") + "\n" )
 
-  val (modularity, regularization) = calcMetrics(communities)
+  val (modularity, regularization) = calcMetrics(communities, true)
   logger.warn(s"Metrics: Modularity = $modularity, Regularization = $regularization, Q = ${modularity + regularization}")
 
   spark.close()
@@ -100,6 +99,7 @@ object Job extends App {
 
     val vertToCommBc = sc.broadcast( vertToComm.collect() )
 
+
     // vertId -> (vertCommId, (commId1 -> commId1degree, commId2 -> commId2degree, ...))
     val commAdjListsByVert: RDD[(Int, (Int, Seq[(Int, Int)]))] = adjLists
       .map { l =>
@@ -111,7 +111,7 @@ object Job extends App {
 
     // commId -> (vertCount, (commId1 -> commId1degree, commId2 -> commId2degree, ...))
     val commAdjLists: RDD[(Int, (Int,  Seq[(Int, Int)]))] = commAdjListsByVert
-      .map { case (vertId, (vertCommId, adjCommList)) => (vertCommId, (1, adjCommList)) } // 1 to count vertices per community
+      .map { case (_, (vertCommId, adjCommList)) => (vertCommId, (1, adjCommList)) } // 1 to count vertices per community
       .reduceByKey { case ((vertCount1, commMap1), (vertCount2, commMap2)) =>
         ( vertCount1 + vertCount2
         , (commMap1 ++ commMap2).groupBy( _._1 ).mapValues( _.map(_._2).sum ).toSeq )
@@ -126,11 +126,17 @@ object Job extends App {
           , adjCommList.filter(_._1 != commId).map(_._2).sum ) )
         }
 
+    val prevDensity = commStats
+      .map( c => commDensity(c._2._1, c._2._2) )
+      .sum
+
+    val prevCommCount = commStats.count.toDouble
+
     // get all possible transitions
     val possibleMoves = commAdjListsByVert
       .flatMap { case (vertId, (vertCommId, adjCommList)) =>
         adjCommList
-          .map { case(adjCommId, degree) => (vertId, adjCommList, vertCommId, adjCommId) }
+          .map { case(adjCommId, _) => (vertId, adjCommList, vertCommId, adjCommId) }
           .filter( v => v._3 != v._4 )
       }
       .keyBy(_._3)
@@ -156,14 +162,25 @@ object Job extends App {
           val deltaModularity =
             (adjCommMap.getOrElse(adjCommId, 0) - adjCommMap.getOrElse(vertCommId, 0)) / e +
               vertDegree * ((vertCommInDegree + vertCommOutDegree) - (adjCommInDegree + adjCommOutDegree) - vertDegree) / (2.0 * e * e)
-          val deltaRegularity = 0.0
-          val deltaQ = deltaModularity + deltaRegularity
 
-          if (deltaQ > 0.000001) List((CommunityUpdate(vertId, vertCommId, adjCommId), deltaQ))
+          val prevRegularization = 0.5 * (prevDensity/prevCommCount - prevCommCount/v)
+          val deltaDensity = commDensity(vertCommVertCount - 1, vertCommInDegree - 2 * adjCommMap.getOrElse(vertCommId, 0)) -
+                             commDensity(vertCommVertCount, vertCommInDegree) +
+                             commDensity(adjCommVertCount + 1, adjCommInDegree + 2 * adjCommMap.getOrElse(adjCommId, 0)) -
+                             commDensity(adjCommVertCount, adjCommInDegree)
+          val currCommCount = if (vertCommVertCount > 1) prevCommCount else prevCommCount - 1
+          val currRegularization = 0.5 * ((prevDensity + deltaDensity)/currCommCount - currCommCount/v)
+
+          val deltaRegularization = currRegularization - prevRegularization
+
+          val deltaQ = deltaModularity + deltaRegularization
+
+          if (deltaQ > 0.000001) List((CommunityUpdate(vertId, vertCommId, adjCommId), deltaQ, deltaModularity, deltaRegularization))
           else Nil
       }
 
     val update = sc.parallelize( goodMoves
+      .map( m => (m._1, m._2))
       .keyBy(_._1.vertexId)
       .groupByKey()
       .mapValues( v => v.maxBy(_._2) )
@@ -178,9 +195,7 @@ object Job extends App {
       ._1
     )
 
-//    println("Update")
-//    update.collect.foreach(println)
-//    println()
+
 
     if (update.isEmpty) prevCommunities
     else {
@@ -198,13 +213,27 @@ object Job extends App {
 //        .foreach(println)
 //      println()
 
-      val (prevMod, prevReg) = calcMetrics(prevCommunities)
-      val (newMod, newReg) = calcMetrics(newCommunities)
+
+      val (prevMod, prevReg) = calcMetrics(prevCommunities, true)
+      val (newMod, newReg) = calcMetrics(newCommunities, false)
 
       val prevQ = prevMod + prevReg
       val newQ = newMod + newReg
 
-      println(s"Step #$step, Q: $prevQ -> $newQ")
+
+      logger.warn(s"Step #$step")
+//      println()
+//      goodMoves.collect().sortBy(-_._2).foreach(println)
+//      println()
+//      update.foreach(println)
+//      println()
+//      newCommunities
+//        .collect()
+//        .sortBy(_._1)
+//        .foreach(v => println((v._1, v._2.sorted)))
+      logger.warn(s"Modularity: $prevMod -> $newMod")
+      logger.warn(s"Regularization: $prevReg -> $newReg")
+      logger.warn(s"Q: $prevQ -> $newQ")
 
       if (newQ < prevQ + 0.000001) {
         if (prevQ < newQ) newCommunities
@@ -215,7 +244,7 @@ object Job extends App {
   }
 
 
-  def calcMetrics(communities: RDD[(Int, Seq[Int])]): (Double, Double) = {
+  def calcMetrics(communities: RDD[(Int, Seq[Int])], debug: Boolean): (Double, Double) = {
     val vertToCommBc = sc.broadcast( communities
       .flatMap( c => c._2.map( (_, c._1) ) )
       .collect() )
@@ -233,18 +262,23 @@ object Job extends App {
 
     val commAdjLists: RDD[(Int, (Int,  Seq[(Int, Int)]))] = commAdjListsByVert
       .reduceByKey { case ((vertCount1, commMap1), (vertCount2, commMap2)) =>
-        ( vertCount1 + vertCount2
-        , (commMap1 ++ commMap2).groupBy( _._1 ).mapValues( _.map(_._2).sum ).toSeq
+        ( vertCount1 + vertCount2, (commMap1 ++ commMap2).groupBy( _._1 ).mapValues( _.map(_._2).sum ).toSeq
         )
       }
 
     val modAndDensByComm = commAdjLists
       .map { case (commId, (vertCount, adjCommList)) =>
-        val adjCommListSplitted = adjCommList.partition(_._1 == commId)
-        val inDegree = adjCommListSplitted._1.map(_._2).sum
-        val outDegree = adjCommListSplitted._2.map(_._2).sum
+        val adjCommListSplit = adjCommList.partition(_._1 == commId)
+        val inDegree = adjCommListSplit._1.map(_._2).sum
+        val outDegree = adjCommListSplit._2.map(_._2).sum
         ( commModularity(inDegree + outDegree, inDegree), commDensity(vertCount, inDegree) )
       }
+
+//    if (debug) {
+//      println
+//      modAndDensByComm.foreach(println)
+//      println
+//    }
 
     val (modularity, totalDensity) = modAndDensByComm
       .reduce( (v1, v2) => (v1._1 + v2._1, v1._2 + v2._2) )
@@ -254,238 +288,4 @@ object Job extends App {
     (modularity, 0.5*(totalDensity/n - n.toDouble/v))
   }
 
-
-  /*
-  def getCommunities: RDD[Community] = {
-    // Initialize communities assigning each vertex to it's own community
-    val initialComms = adjLists
-      .map(v =>
-        Community(
-          id = v.id
-          , vertices = Seq(v.id)
-          , in_degree = 0
-          , out_degrees = v.adj.map(_ -> 1) // per community
-          , total_out = v.adj.size
-          , total_deg = v.adj.size
-          , density = 1.0
-          , modularity = commModularity(v.adj.size, 0)
-        )
-      )
-
-    println("Initial communities")
-    initialComms
-      .collect()
-      .sortBy(_.id)
-      .foreach(println)
-    println("")
-
-    val finalCommunities = getCommunitiesStep(initialComms, 0)
-
-    println("Final communities")
-    finalCommunities
-      .collect()
-      .sortBy(_.id)
-      .foreach(println)
-    println("")
-
-    finalCommunities
-  }
-
-  @tailrec
-  def getCommunitiesStep(communities: RDD[Community], step: Int): RDD[Community] = {
-    val totalDens = communities.map(_.density).sum()
-    val commCount = communities.count()
-
-    val vertexCommStats = getVertexCommStats(communities)
-
-    val availableMoves = vertexCommStats
-      .flatMap { v => v.adjComm.map(a => (v.id, v.degree, v.adjComm, v.commId, a._1)) }
-
-    val goodMoves = availableMoves
-      .keyBy(_._4)
-      .join(communities.keyBy(_.id))
-      .map { case (_, ((vertId, vertDegree, vertAdjComm, commFromId, commToId), commFrom)) =>
-        (vertId, vertDegree, vertAdjComm, commFrom, commToId)
-      }
-      .keyBy(_._5)
-      .join(communities.keyBy(_.id))
-      .map { case (_, ((vertId, vertDegree, vertAdjComm, commFrom, commToId), commTo)) =>
-        (vertId, (vertDegree, vertAdjComm, commFrom, commTo))
-      }
-      .groupByKey()
-      .flatMap { case (vertId, moves) =>
-        val goodMoves1 = moves.flatMap { case (vertDegree, vertAdjComm, commFrom, commTo) =>
-          val vertDegCommFrom = vertAdjComm.toMap.getOrElse(commFrom.id, 0)
-          val vertDegCommTo = vertAdjComm.toMap.getOrElse(commTo.id, 0)
-
-          val deltaModularity = (vertDegCommTo - vertDegCommFrom) / e.toDouble +
-            vertDegree * (commFrom.total_deg - commTo.total_deg - vertDegree) / (2.0 * e * e)
-
-          val deltaRegularization = 0.0
-
-          val deltaQ = deltaModularity + deltaRegularization
-
-          if (deltaQ > 0.000001) List((CommunityUpdate(vertId, commFrom.id, commTo.id), deltaQ))
-          else Nil
-        }
-
-        if (goodMoves1.nonEmpty) List(goodMoves1.maxBy(_._2))
-        else Nil
-      }
-
-    println("Good moves")
-    goodMoves
-      .collect()
-      .sortBy(-_._2)
-      .foreach(println)
-    println("")
-
-    val update = goodMoves
-      .collect()
-      .sortBy(-_._2)
-      .foldLeft((Seq[CommunityUpdate](), Set[Int]())) {
-        case (acc, (upd, _)) =>
-          if (acc._2.contains(upd.commFrom) || acc._2.contains(upd.commTo)) acc
-          else (acc._1 ++ Seq(upd), acc._2 ++ Set(upd.commFrom, upd.commTo))
-      }
-      ._1
-
-    println("Independent good moves")
-    update
-      .foreach(println)
-    println("")
-
-    val newCommunities = updateCommunities(communities, sc.parallelize(update), vertexCommStats)
-
-    val prevMetrics = calcMetrics(communities)
-    val currMetrics = calcMetrics(newCommunities)
-
-    println("New communities")
-    newCommunities
-      .collect()
-      .sortBy(_.id)
-      .foreach(println)
-    println("")
-
-    println(s"Curr metrics: $currMetrics, Prev metrics: $prevMetrics\n")
-
-    val prevQ = prevMetrics._1 + prevMetrics._2
-    val currQ = currMetrics._1 + currMetrics._2
-
-    if (currQ < prevQ + 0.000001) {
-      if (prevQ < currQ) newCommunities
-      else communities
-    }
-    else getCommunitiesStep(newCommunities, step + 1)
-  }
-
-
-  // update:  pairs vertex, community id
-  def updateCommunities(communities: RDD[Community], update: RDD[CommunityUpdate], vertCommStats: RDD[VertexCommData]): RDD[Community] = {
-    val commsWithUpdates = communities
-      .keyBy(_.id)
-      .leftOuterJoin(update.flatMap(u => Seq((u.commFrom, (u.vertexId, false)), (u.commTo, (u.vertexId, true)))))
-
-    //    println("commsWithUpdates")
-    //    commsWithUpdates
-    //      .filter(_._2._2.isDefined)
-    //      .map( v => (v._2._1, v._2._2.get) )
-    //      .keyBy(_._2._1)
-    //      .join(vertCommStats.keyBy(_.id))
-    //      .foreach(println)
-    //    println("")
-
-    commsWithUpdates
-      .filter(_._2._2.isEmpty)
-      .map(_._2._1)
-      .union(
-        commsWithUpdates
-          .filter(_._2._2.isDefined)
-          .map(v => (v._2._1, v._2._2.get))
-          .keyBy(_._2._1)
-          .join(vertCommStats.keyBy(_.id))
-          .flatMap { j =>
-            val comm = j._2._1._1
-            val update = j._2._1._2
-
-            val (vertId, append) = update
-            val vertCommStats = j._2._2
-            val vertAdjComms = vertCommStats.adjComm.toMap
-
-            val (new_vertices, new_in_degree, new_out_degrees) = {
-              if (append) { // add vertex to community
-                (comm.vertices ++ Iterable(vertId)
-                  , comm.in_degree + 2 * vertAdjComms.getOrElse(comm.id, 0)
-                  , comm.out_degrees
-                  .flatMap { case (commId, deg) =>
-                    if (commId != vertCommStats.commId) Seq((commId, deg))
-                    else {
-                      val new_deg = deg - vertAdjComms.getOrElse(comm.id, 0)
-                      if (new_deg > 0) Seq((commId, new_deg))
-                      else Seq[(Int, Int)]()
-                    }
-                  }
-                  .map(v => if (!vertAdjComms.contains(v._1)) v else (v._1, v._2 + vertAdjComms(v._1))) ++
-                  vertAdjComms.filter(_._1 != comm.id).filter(a => !comm.out_degrees.toMap.contains(a._1))
-                )
-              } else { // remove vertex from community
-                (comm.vertices.filter(_ != vertId)
-                  , comm.in_degree - 2 * vertAdjComms.getOrElse(comm.id, 0)
-                  , comm.out_degrees
-                  .map(v => if (!vertAdjComms.contains(v._1)) v else (v._1, v._2 - vertAdjComms(v._1)))
-                  .filter(_._2 > 0)
-                )
-              }
-            }
-
-            if (new_vertices.isEmpty) Seq[Community]()
-            else
-              Seq(Community(
-                id = new_vertices.min
-                , vertices = new_vertices
-                , in_degree = new_in_degree
-                , out_degrees = new_out_degrees
-                , total_out = new_out_degrees.map(_._2).sum
-                , total_deg = new_in_degree + new_out_degrees.map(_._2).sum
-                , density = commDensity(new_vertices.size, new_in_degree)
-                , modularity = commModularity(new_in_degree + new_out_degrees.map(_._2).sum, new_in_degree)
-              ))
-          }
-      )
-  }
-
-
-  def calcMetrics(communities: RDD[Community]): (Double, Double) = {
-    val (total_modularity, total_density) = communities
-      .map(c => (c.modularity, c.density))
-      .reduce { case (v1, v2) => (v1._1 + v2._1, v1._2 + v2._2) }
-
-    val n = communities.count().toDouble
-
-    (total_modularity, 0.5 * (total_density / n - n / v))
-  }
-
-
-  def getVertexCommStats(communities: RDD[Community]): RDD[VertexCommData] = {
-    val vertToComm = communities
-      .flatMap(c => c.vertices.map(v => (v, c.id)))
-
-    adjLists
-      .flatMap(v => v.adj.map((v.id, _)))
-      .keyBy(_._2)
-      .join(vertToComm) // (vertId2, ((vertId1, vertId2), commId2))
-      .map(v => (v._2._1._1, v._2._2)) // vertId1, commId2
-      .groupByKey()
-      .mapValues(adjComms => adjComms.groupBy(v => v).mapValues(_.size).toSeq)
-      .join(vertToComm) // (vertId1, (Iterable[commId2, count], commId1)
-      .map(v =>
-        VertexCommData(
-          id = v._1
-          , degree = v._2._1.map(_._2).sum
-          , commId = v._2._2
-          , adjComm = v._2._1
-        )
-      )
-  }
-  */
 }
