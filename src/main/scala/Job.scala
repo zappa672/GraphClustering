@@ -20,7 +20,7 @@ object Job extends App {
 
   val sc: SparkContext = spark.sparkContext
 
-  val filePath: String = this.getClass.getResource("/input/test0.graph").getPath
+  val filePath: String = this.getClass.getResource("/input/1.graph").getPath
 
   logger.warn(s"Read graph data $filePath.")
   val (edges, adjLists) = loadGraph(filePath)
@@ -70,7 +70,10 @@ object Job extends App {
     inDegree / graphTotalDegree - Math.pow(commTotalDegree / graphTotalDegree, 2.0)
 
 
+
+
   def getCommunities: RDD[(Int, Seq[Int])] = {
+    // Assign each vertex to own community
     val initialComms = adjLists.map( v => (v.id, Seq(v.id)) )
 
 //    println(s"Initial communities")
@@ -80,6 +83,7 @@ object Job extends App {
 //      .foreach(println)
 //    println()
 
+    logger.warn(s"Initial communities size: ${initialComms.count}")
     val finalCommunities = getCommunitiesStep(initialComms, 0)
 
 //    println(s"Final communities")
@@ -108,6 +112,7 @@ object Job extends App {
         , ( vertToCommMap(l.id)
         , l.adj.map( vertToCommMap(_) ).groupBy( v => v ).mapValues( _.size ).toSeq ) )
       }
+    logger.warn(s"commAdjListsByVert size: ${commAdjListsByVert.count}")
 
     // commId -> (vertCount, (commId1 -> commId1degree, commId2 -> commId2degree, ...))
     val commAdjLists: RDD[(Int, (Int,  Seq[(Int, Int)]))] = commAdjListsByVert
@@ -116,6 +121,7 @@ object Job extends App {
         ( vertCount1 + vertCount2
         , (commMap1 ++ commMap2).groupBy( _._1 ).mapValues( _.map(_._2).sum ).toSeq )
       }
+    logger.warn(s"commAdjLists size: ${commAdjLists.count}")
 
     // commId -> (vertCount, inDegree, outDegree)
     val commStats = commAdjLists
@@ -125,6 +131,7 @@ object Job extends App {
           , adjCommList.filter(_._1 == commId).map(_._2).sum
           , adjCommList.filter(_._1 != commId).map(_._2).sum ) )
         }
+    logger.warn(s"commStats size: ${commAdjLists.count}")
 
     val prevDensity = commStats
       .map( c => commDensity(c._2._1, c._2._2) )
@@ -149,6 +156,7 @@ object Job extends App {
       .map { case (_, ((vertId, adjCommList, vertCommStats, adjCommId), adjCommStats)) =>
         (vertId, adjCommList, vertCommStats, (adjCommId, adjCommStats))
       }
+    logger.warn(s"possibleMoves size: ${possibleMoves.count}")
 
     // get all possible transitions
     val goodMoves = possibleMoves
@@ -178,6 +186,7 @@ object Job extends App {
           if (deltaQ > 0.000001) List((CommunityUpdate(vertId, vertCommId, adjCommId), deltaQ, deltaModularity, deltaRegularization))
           else Nil
       }
+    logger.warn(s"goodMoves size: ${goodMoves.count}")
 
     val update = sc.parallelize( goodMoves
       .map( m => (m._1, m._2))
@@ -194,6 +203,7 @@ object Job extends App {
       }
       ._1
     )
+    logger.warn(s"update size: ${update.count}")
 
 
 
@@ -289,3 +299,4 @@ object Job extends App {
   }
 
 }
+
