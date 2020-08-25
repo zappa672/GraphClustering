@@ -147,50 +147,48 @@ object Job extends App {
 
     // get all possible transitions
     val goodMoves: RDD[(Int, Int, Int)] = prevVertCommStats
-      .flatMap{ case (vertId, (_, commId, adjCommList)) =>
+      .flatMap{ case (vertId, (vertDegree, currCommId, adjCommList)) =>
         adjCommList
-          .filter(_._1 != commId)
-          .map { case (adjCommId, _) => (vertId, (commId, adjCommId)) }
-      }
-      .keyBy(_._2._1)
-      .join( prevCommStats )
-      .map{ case (vertCommId, ((vertId, (_, adjCommId)), vertCommStats)) =>
-        (vertId, ((vertCommId, vertCommStats), adjCommId))
+          .filter(_._1 != currCommId)
+          .map { case (adjCommId, _) =>
+            val vertCurrCommStats = adjCommList.filter(_._1 == currCommId)
+            val vertAdjCommStats = adjCommList.filter(_._1 == adjCommId)
+
+            val vertCurrCommDegree = if (vertCurrCommStats.isEmpty) 0 else vertCurrCommStats.head._2
+            val vertAdjCommDegree = if (vertAdjCommStats.isEmpty) 0 else vertAdjCommStats.head._2
+
+            (vertId, (vertDegree, currCommId, adjCommId, vertCurrCommDegree, vertAdjCommDegree))
+          }
       }
       .keyBy(_._2._2)
       .join( prevCommStats )
-      .map { case (adjCommId, ((vertId, ((vertCommId, vertCommStats), _)), adjCommStats)) =>
-        (vertId, ((vertCommId, vertCommStats), (adjCommId, adjCommStats)))
+      .map{ case (_, ((vertId, (vertDegree, currCommId, adjCommId, vertCurrCommDegree, vertAdjCommDegree)), currCommStats)) =>
+        (vertId, (vertDegree, currCommId, adjCommId, vertCurrCommDegree, vertAdjCommDegree, currCommStats))
       }
-      .keyBy(_._1)
-      .join( prevVertCommStats )
-      .map { case (vertId, ((_, ((vertCommId, vertCommStats), (adjCommId, adjCommStats))), vertexCommStats)) =>
-        (vertId, vertexCommStats._1, vertexCommStats._3, (vertCommId, vertCommStats), (adjCommId, adjCommStats))
+      .keyBy(_._2._3)
+      .join( prevCommStats )
+      .map { case (_, ((vertId, (vertDegree, currCommId, adjCommId, vertCurrCommDegree, vertAdjCommDegree, currCommStats)), adjCommStats)) =>
+        (vertId, (vertDegree, currCommId, adjCommId, vertCurrCommDegree, vertAdjCommDegree, currCommStats, adjCommStats))
       }
       .flatMap {
-        case(vertId, vertDegree, adjCommList, (vertCommId, vertCommStats), (adjCommId, adjCommStats)) =>
-          val adjCommMap = adjCommList.toMap
-
-          val (vertCommVertCount, vertCommInDegree, vertCommOutDegree, vertCommDensity) = vertCommStats
+        case(vertId, (vertDegree, currCommId, adjCommId, vertCurrCommDegree, vertAdjCommDegree, currCommStats, adjCommStats)) =>
+          val (currCommVertCount, currCommInDegree, currCommOutDegree, currCommDensity) = currCommStats
           val (adjCommVertCount, adjCommInDegree, adjCommOutDegree, adjCommDensity) = adjCommStats
 
-          val deltaModularity =
-            (adjCommMap.getOrElse(adjCommId, 0) - adjCommMap.getOrElse(vertCommId, 0)) / e +
-            vertDegree * ((vertCommInDegree + vertCommOutDegree) - (adjCommInDegree + adjCommOutDegree) - vertDegree) / (2.0 * e * e)
+          val deltaModularity = (vertAdjCommDegree - vertCurrCommDegree) / e +
+            vertDegree * ((currCommInDegree + currCommOutDegree) - (adjCommInDegree + adjCommOutDegree) - vertDegree) / (2.0 * e * e)
 
           val prevRegularization = 0.5 * (prevTotalDensity/prevCommCount - prevCommCount/v)
-          val deltaDensity = commDensity(vertCommVertCount - 1, vertCommInDegree - 2 * adjCommMap.getOrElse(vertCommId, 0)) -
-                             vertCommDensity +
-                             commDensity(adjCommVertCount + 1, adjCommInDegree + 2 * adjCommMap.getOrElse(adjCommId, 0)) -
-                             adjCommDensity
-          val currCommCount = if (vertCommVertCount > 1) prevCommCount else prevCommCount - 1
+          val deltaDensity = commDensity(currCommVertCount - 1, currCommInDegree - 2 * vertCurrCommDegree) - currCommDensity +
+                             commDensity(adjCommVertCount + 1, adjCommInDegree + 2 * vertAdjCommDegree) - adjCommDensity
+          val currCommCount = if (currCommVertCount > 1) prevCommCount else prevCommCount - 1
           val currRegularization = 0.5 * ((prevTotalDensity + deltaDensity)/currCommCount - currCommCount/v)
 
           val deltaRegularization = currRegularization - prevRegularization
 
           val deltaQ = deltaModularity + deltaRegularization
 
-          if (deltaQ > 0.000001) List( ((vertId, vertCommId, adjCommId), deltaQ) )
+          if (deltaQ > 0.000001) List( ((vertId, currCommId, adjCommId), deltaQ) )
           else Nil
       }
     .keyBy(_._1._1)
