@@ -3,6 +3,8 @@
 bin/
 project/project
 project/target
+communities/
+results/
 target/
 build/
 
